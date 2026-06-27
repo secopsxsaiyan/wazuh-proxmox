@@ -1,0 +1,242 @@
+<!--
+  Proxmox VE -> Wazuh custom rules — proxmox_rules.xml.
+  For a Proxmox VE host (Debian-based) running the Wazuh agent.
+
+  WHY THIS IS A *RULES-ONLY* PACK (no custom decoders needed)
+  ====================================================================================
+  A Proxmox host runs a FULL Wazuh agent, so every field these rules need is ALREADY
+  produced by STOCK decoders — no custom decoder is required (and none would even win:
+  stock decoders in ruleset/decoders load BEFORE etc/decoders, so a bespoke pveproxy/
+  pvedaemon decoder could not pre-empt the stock one). Specifically:
+    - pvedaemon lines -> stock 0440-proxmox-ve_decoders.xml, base rule 87200.
+    - pveproxy access.log lines -> stock 0375-web-accesslog decoder sets srcip/url/id;
+      stock base rule 31100 (category web-log), 31101 (HTTP 4xx). We specialise that chain.
+    - /etc/pve FIM -> stock syscheck parents 550/553/554 set the 'file' field.
+
+  WHAT STOCK ALREADY COVERS (do NOT duplicate — these ship in Wazuh 4.x, rules 0495):
+    - 87201 (L6) PVE auth failure (@pam/@pve), 87202 (L10) PVE brute force (8/120s,
+      same_source_ip, T1110), 87203 (L3) PVE auth success.  -> kept as the safety net; we
+      do NOT add rule_exclude and do NOT re-implement pvedaemon auth here.
+  WHAT STOCK LEAVES SILENT (all of this routes to 87200 L0) — the gap this pack fills:
+    - VM/CT lifecycle (create/DESTROY/backup/migrate), pveum admin/token, /etc/pve FIM.
+
+  LEVEL DISCIPLINE (triage gate = L10; >=10 reaches analyst triage):
+    - destruction & rogue-admin (user.cfg / priv / corosync) -> L10 immediately (no freq gate).
+    - single auth failure -> L8 (below gate); brute-force composite -> L10.
+    - routine admin (VM create / vzdump / migrate / pveum) -> L6-L8 (visibility, below gate).
+    - status/housekeeping -> handled by stock 87200/pvestatd, not re-rated here.
+
+  Rule IDs 100390-100394, 100416-100423 (verify the range is free on your manager before installing).
+  NB: 100416-100423 were renumbered from 100400-100409 to avoid colliding with
+  socfortress 100100-MITRE_TECHNIQUES_FROM_SYSMON_EVENT1.xml (which owns 100400-100415):
+    grep -rhoE 'rule id="(10039[0-4]|1004(1[6-9]|2[0-3]))"' \
+      /var/ossec/etc/rules/ /var/ossec/ruleset/rules/   # expect: empty
+
+  *** VALIDATE BEFORE TRUSTING (two known unknowns) ***
+    a) The UPID task-type tokens (qmdestroy, vzdestroy, vzdump, qmmigrate, vzcreate, ...)
+       and whether pveum operations log via pvedaemon at all are from the documented UPID
+       format, NOT guaranteed on every PVE version. Confirm against a real line:
+         journalctl -u pvedaemon -S '7 days ago' | grep 'task UPID' \
+           | grep -oE 'UPID:[^ ]+' | sort -u
+       then feed a sample through /var/ossec/bin/wazuh-logtest.
+       If pveum has no pvedaemon UPID line, rule 100394 simply never fires (harmless) and
+       /etc/pve/user.cfg FIM (100419) remains the reliable rogue-admin/token detector.
+    b) pveproxy may log srcip as an IPv4-mapped ::ffff:1.2.3.4. same_source_ip works either
+       way; MISP IP-IOC correlation (100210/100211) may need the ::ffff: prefix normalised.
+-->
+<group name="proxmox,proxmox-ve,">
+
+  <!-- ============================================================
+       A. PVE task lifecycle + admin plane  (chain off stock base 87200)
+       87200 = "pvedaemon messages grouped" (decoded_as pvedaemon, L0). The stock
+       pvedaemon decoder extracts no fields from task lines, so we match the raw
+       message. UPID layout: UPID:<node>:<pid>:<pstart>:<starttime>:<DTYPE>:<id>:<user>:
+       ============================================================ -->
+
+  <!-- New VM/CT created or restored — routine admin, visibility only. -->
+  <rule id="100390" level="6">
+    <if_sid>87200</if_sid>
+    <match type="pcre2">starting task UPID:[^:]+:[^:]+:[^:]+:[^:]+:(qmcreate|vzcreate|pct_create|qmrestore|vzrestore)</match>
+    <description>Proxmox: VM/CT created or restored — verify the initiating user and VMID.</description>
+    <mitre><id>T1578.002</id></mitre>
+    <group>proxmox_vm_lifecycle,</group>
+  </rule>
+
+  <!-- VM/CT DESTROYED — immediate triage. An actor with PVE access can wipe guests on the
+       hypervisor. No frequency gate: any destroy is review-worthy. -->
+  <rule id="100391" level="10">
+    <if_sid>87200</if_sid>
+    <match type="pcre2">starting task UPID:[^:]+:[^:]+:[^:]+:[^:]+:(qmdestroy|vzdestroy|pct_destroy)</match>
+    <description>Proxmox: VM/CT DESTROYED — verify authorised maintenance or investigate destructive activity.</description>
+    <mitre><id>T1578.001</id></mitre>
+    <mitre><id>T1485</id></mitre>
+    <group>proxmox_vm_lifecycle,proxmox_destruction,</group>
+  </rule>
+
+  <!-- vzdump backup job started — visibility (exfil/anti-recovery context). -->
+  <rule id="100392" level="6">
+    <if_sid>87200</if_sid>
+    <match type="pcre2">starting task UPID:[^:]+:[^:]+:[^:]+:[^:]+:vzdump</match>
+    <description>Proxmox: vzdump backup job initiated — verify it is a scheduled job.</description>
+    <mitre><id>T1005</id></mitre>
+    <group>proxmox_backup,</group>
+  </rule>
+
+  <!-- VM/CT migration — unexpected migration can indicate guest hijack or HA manipulation. -->
+  <rule id="100393" level="7">
+    <if_sid>87200</if_sid>
+    <match type="pcre2">starting task UPID:[^:]+:[^:]+:[^:]+:[^:]+:(qmmigrate|vzmigrate)</match>
+    <description>Proxmox: VM/CT migration initiated — verify authorised maintenance.</description>
+    <mitre><id>T1578</id></mitre>
+    <group>proxmox_vm_lifecycle,</group>
+  </rule>
+
+  <!-- pveum user/role/ACL/token admin op (BEST-EFFORT — see validation note (a)).
+       Primary, reliable detector for rogue admins/tokens is the user.cfg FIM rule 100419.
+       L8: below the gate (legitimate admin ops happen); token creation escalates via 100419. -->
+  <rule id="100394" level="8">
+    <if_sid>87200</if_sid>
+    <match type="pcre2">UPID:[^:]+:[^:]+:[^:]+:[^:]+:pveum|\bpveum (useradd|usermod|aclmod|tokenadd|tokenmod|roleadd|rolemod)</match>
+    <description>Proxmox: PVE user/role/ACL/token management (pveum) — verify authorised admin action.</description>
+    <mitre><id>T1136.001</id></mitre>
+    <mitre><id>T1098</id></mitre>
+    <group>proxmox_admin,account_management,</group>
+  </rule>
+
+  <!-- ============================================================
+       B. PVE web-UI / API auth via pveproxy access.log
+       PREREQ: collect /var/log/pveproxy/access.log as a localfile (see README).
+       Stock 0375-web-accesslog decodes srcip + url + id(status); stock 31100 (base,
+       category web-log) and 31101 (4xx) fire. We specialise to /access/ticket so analysts
+       see "PVE login" not "web 400", and add a tighter brute-force composite. srcip is
+       canonical -> MISP IP-IOC rules 100210/100211 auto-flag known-bad sources.
+       (Additive to stock 87201/87202, which see the same auth from pvedaemon; the access.log
+       uniquely provides the source IP on SUCCESS, which the pvedaemon success decoder lacks.)
+       ============================================================ -->
+
+  <!-- Successful PVE web-UI / API login (HTTP 200 on /access/ticket) — note the source IP.
+       NB: PVE tickets auto-renew ~every 30 min per open browser tab, so a steady trickle of
+       these is normal; correlate against prior failures before treating one as a new login.
+       if_sid MUST include 31108: stock 31108 "Ignored URLs" (L0) claims every 2xx/3xx
+       web-accesslog event as a child of 31100, and once it fires only ITS children are
+       evaluated — with if_sid=31100 alone this rule is never reached (verified by logtest).
+       Dual-parent idiom mirrors stock 31103/31509. 4xx lines skip 31108, so 100417
+       (child of 31101) is unaffected. -->
+  <rule id="100416" level="4">
+    <if_sid>31100,31108</if_sid>
+    <url>/access/ticket</url>
+    <id>^200</id>
+    <description>Proxmox: PVE web-UI/API login SUCCESS from $(srcip) [HTTP $(id) $(url)].</description>
+    <mitre><id>T1078</id></mitre>
+    <group>authentication_success,proxmox_auth,</group>
+  </rule>
+
+  <!-- Failed PVE web-UI / API login (4xx on /access/ticket). Single failure stays below gate. -->
+  <rule id="100417" level="8">
+    <if_sid>31101</if_sid>
+    <url>/access/ticket</url>
+    <description>Proxmox: PVE web-UI/API login FAILURE from $(srcip) [HTTP $(id) $(url)].</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failed,proxmox_auth,</group>
+  </rule>
+
+  <!-- HTTP-layer brute force: 6 failures / 120s from one source -> triage. Tighter than the
+       stock web composite 31151 (14/90s) because this is a hypervisor management plane. -->
+  <rule id="100418" level="10" frequency="6" timeframe="120">
+    <if_matched_sid>100417</if_matched_sid>
+    <same_source_ip />
+    <description>Proxmox: PVE web-UI/API brute force from $(srcip) — repeated login failures.</description>
+    <mitre><id>T1110.001</id></mitre>
+    <group>authentication_failures,proxmox_auth,brute_force,</group>
+  </rule>
+
+  <!-- ============================================================
+       C. /etc/pve FIM escalation  (chain off stock syscheck 550/553/554)
+       /etc/pve is a FUSE/pmxcfs mount -> scheduled scan only (no realtime); see the README
+       agent.conf snippet for the scan + noise-ignore config and the FUSE caveat.
+       ============================================================ -->
+
+  <!-- PVE user/permission database: any change can mean a rogue admin or token was added. -->
+  <rule id="100419" level="10">
+    <if_sid>550,553,554</if_sid>
+    <field name="file">^/etc/pve/user\.cfg$</field>
+    <description>Proxmox FIM: /etc/pve/user.cfg changed — possible rogue PVE admin/ACL/token addition.</description>
+    <mitre><id>T1098</id></mitre>
+    <mitre><id>T1136.001</id></mitre>
+    <group>syscheck,fim_escalation,account_management,</group>
+  </rule>
+
+  <!-- Cluster CA key / token secrets / TFA under /etc/pve/priv. -->
+  <rule id="100420" level="10">
+    <if_sid>550,553,554</if_sid>
+    <field name="file" type="pcre2">^/etc/pve/priv/</field>
+    <description>Proxmox FIM: /etc/pve/priv/ key or secret changed ($(file)) — verify authorised key rotation.</description>
+    <mitre><id>T1552</id></mitre>
+    <group>syscheck,fim_escalation,</group>
+  </rule>
+
+  <!-- Cluster membership config: a corosync.conf change means nodes added/removed. -->
+  <rule id="100421" level="10">
+    <if_sid>550,553,554</if_sid>
+    <field name="file" type="pcre2">^/etc/pve/corosync\.conf$</field>
+    <description>Proxmox FIM: /etc/pve/corosync.conf changed — possible unauthorised cluster membership change.</description>
+    <mitre><id>T1489</id></mitre>
+    <group>syscheck,fim_escalation,cluster_integrity,</group>
+  </rule>
+
+  <!-- Host/guest firewall config: rule bypass risk. Below gate (configured routinely). -->
+  <rule id="100422" level="8">
+    <if_sid>550,553,554</if_sid>
+    <field name="file" type="pcre2">^/etc/pve/firewall/</field>
+    <description>Proxmox FIM: PVE firewall configuration changed ($(file)) — verify authorised update.</description>
+    <mitre><id>T1562.007</id></mitre>
+    <group>syscheck,fim_escalation,</group>
+  </rule>
+
+  <!-- Storage / datacenter config — visibility (changed legitimately during admin work). -->
+  <rule id="100423" level="7">
+    <if_sid>550,553,554</if_sid>
+    <field name="file" type="pcre2">^/etc/pve/(storage|datacenter)\.cfg$</field>
+    <description>Proxmox FIM: PVE storage/datacenter configuration changed ($(file)).</description>
+    <mitre><id>T1098</id></mitre>
+    <group>syscheck,fim_escalation,</group>
+  </rule>
+
+</group>
+
+<!-- ============================================================
+     D. Proxmox-host auditd execve noise suppression
+     These Wazuh-layer de-rates complement the source-level auditd never-rules
+     (see audit-rules/99-wazuh-mitre.rules in this pack). The primary fix is the
+     never-rule (audited at the kernel before Wazuh ever sees the event); this rule
+     provides a second line of defence for transient or deployment windows where the
+     never-rules are not yet applied.
+     ============================================================ -->
+<group name="proxmox,proxmox-ve,audit,audit_anom,">
+
+  <!-- De-rate stock rule 80789 ("Audit: Watch - Execute access", L3) for the benign
+       daemon-context mawk that Proxmox's own services run constantly (pvestatd polling
+       /proc/meminfo, proxmox-firewall pipelines). Source: 24h execve histogram on a
+       Proxmox host — ~1,763 events/24h, all auid=4294967295 (no login session), cwd=/.
+
+       SCOPE / SAFETY: matches ONLY /usr/bin/mawk AND auid=4294967295 (daemon, no login
+       session) AND cwd=/. A human running awk in a login session (auid set) still fires
+       80789 at L3. A look-alike binary outside /usr/bin/mawk does NOT match. Offensive
+       tooling is untouched — nmap/masscan still fire 200166 (T1046, L12), /tmp|/dev/shm
+       exec still fires 200180 (L12).
+
+       PROHIBITED from this suppression (must never be added here — would blind detection
+       rules): nmap, nc, netcat, masscan, rustscan, hping3, socat, wget, curl, ssh.
+
+       NOTE: the source-level fix (auditd never-rule for /usr/bin/mawk) is in
+       audit-rules/99-wazuh-mitre.rules. This Wazuh rule is defense-in-depth only. -->
+  <rule id="100023" level="1">
+    <if_sid>80789</if_sid>
+    <field name="audit.exe">^/usr/bin/mawk$</field>
+    <field name="audit.auid">^4294967295$</field>
+    <field name="audit.cwd">^/$</field>
+    <description>Auditd: benign daemon mawk (Proxmox pvestatd/firewall polling, no login session) — de-rated</description>
+    <group>audit,audit_anom,</group>
+  </rule>
+
+</group>

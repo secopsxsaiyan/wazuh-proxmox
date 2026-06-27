@@ -1,0 +1,81 @@
+## /etc/audit/rules.d/99-wazuh-mitre.rules
+## Feeds the Wazuh auditd MITRE ATT&CK layer (manager rules 200110-200200+).
+## Keys match /var/ossec/etc/lists/audit-keys  (audit-wazuh-w/r/a/x/c).
+##
+## ADDITIVE: this file does NOT contain `-D` or `-e 2`, so it will not delete other
+## audit rules already on the host and does not make the ruleset immutable.
+
+
+## ---- NEVER-rules: daemon execve firehose suppression (auid=4294967295 = no login session) ----
+## These must come BEFORE the always,exit execve catch-all below. auditd is first-match-wins.
+## Scope: ONLY unattended daemon processes (auid=4294967295). A real interactive login session
+## will NOT match (auid is set to the uid of the logged-in user), so 80789 / 200111 still fires
+## for human-initiated execve. Exact exe= path match prevents a look-alike binary in another
+## path from slipping through silently.
+##
+## Source: 24h execve histogram on a Proxmox host, daemon-only (auid=4294967295) top talkers.
+##
+## PROHIBITED from this list (must never be added here — would blind detection rules):
+##   nmap, nc, netcat, masscan, rustscan, hping3, socat, wget, curl, ssh
+##   (these feed rule 200166 T1046 network-scan detection and other IOC rules)
+##
+## /usr/bin/perl  — pvestatd Proxmox stat daemon
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/perl -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/bin/perl -F auid=4294967295
+## /usr/bin/lxc-info  — LXC container status polling
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/lxc-info -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/bin/lxc-info -F auid=4294967295
+## /usr/libexec/proxmox/proxmox-firewall  — Proxmox firewall daemon
+-a never,exit -F arch=b64 -S execve -F exe=/usr/libexec/proxmox/proxmox-firewall -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/libexec/proxmox/proxmox-firewall -F auid=4294967295
+## /usr/sbin/nft  — nftables rule reload by Proxmox firewall daemon
+-a never,exit -F arch=b64 -S execve -F exe=/usr/sbin/nft -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/sbin/nft -F auid=4294967295
+## /usr/sbin/lvm  — LVM snapshot/activation ops
+-a never,exit -F arch=b64 -S execve -F exe=/usr/sbin/lvm -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/sbin/lvm -F auid=4294967295
+## /usr/bin/timeout  — wrapper used by various Proxmox scripts
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/timeout -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/bin/timeout -F auid=4294967295
+## /usr/bin/mawk  — awk variant, Proxmox/LXC mgmt scripts
+
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/mawk -F auid=4294967295
+-a never,exit -F arch=b32 -S execve -F exe=/usr/bin/mawk -F auid=4294967295
+
+## ---- Execution (T1059) → EXECVE + SYSCALL events (rules 200111, 200122, command MITRE) ----
+-a always,exit -F arch=b64 -S execve -k audit-wazuh-x
+-a always,exit -F arch=b32 -S execve -k audit-wazuh-x
+
+## ---- Privilege escalation (T1548) — setuid/setgid family ----
+-a always,exit -F arch=b64 -S setuid,setgid,setreuid,setregid,setresuid,setresgid -k audit-wazuh-x
+
+## ---- Credential files (T1003) — modifications ----
+-w /etc/passwd  -p wa -k audit-wazuh-w
+-w /etc/shadow  -p wa -k audit-wazuh-w
+-w /etc/gshadow -p wa -k audit-wazuh-w
+-w /etc/group   -p wa -k audit-wazuh-w
+
+## ---- Privilege / scheduled-task persistence (T1548 / T1053) ----
+-w /etc/sudoers     -p wa -k audit-wazuh-w
+-w /etc/sudoers.d   -p wa -k audit-wazuh-w
+-w /etc/crontab     -p wa -k audit-wazuh-w
+-w /etc/cron.d      -p wa -k audit-wazuh-w
+-w /etc/cron.daily  -p wa -k audit-wazuh-w
+-w /etc/cron.hourly -p wa -k audit-wazuh-w
+-w /var/spool/cron  -p wa -k audit-wazuh-w
+
+## ---- Shell-profile persistence (T1546.004) → feeds rules 200120/200121 ----
+-w /root/.ssh          -p wa -k audit-wazuh-w
+-w /root/.bashrc       -p wa -k audit-wazuh-w
+-w /root/.bash_profile -p wa -k audit-wazuh-w
+-w /root/.profile      -p wa -k audit-wazuh-w
+-w /etc/profile        -p wa -k audit-wazuh-w
+-w /etc/profile.d      -p wa -k audit-wazuh-w
+-w /etc/bash.bashrc    -p wa -k audit-wazuh-w
+
+## ---- Kernel module load/unload (T1547.006 / rootkits) ----
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k audit-wazuh-c
+
+## ---- Network-config tampering (T1565) ----
+-w /etc/hosts       -p wa -k audit-wazuh-w
+-w /etc/resolv.conf -p wa -k audit-wazuh-w
