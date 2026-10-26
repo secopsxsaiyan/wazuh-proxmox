@@ -1,0 +1,90 @@
+# Proxmox VE Management-Plane Hardening — Wazuh SCA policy (file-only).
+# https://github.com/secopsxsaiyan/wazuh-proxmox
+#
+# Deploy to the Proxmox agent group (see README). Failures escalate to L10 via rule 101511
+# (child of stock 19007), which matches this policy's NAME — keep `name` unchanged.
+#
+# FILE-ONLY by design: every rule uses f:/d: checks (no c: command checks), so the agent runs
+# ZERO remote commands — a manager compromise cannot pivot to command execution on the
+# hypervisor via SCA (keep sca.remote_commands=0 on the agent). Deliberately scoped to
+# PVE-specific management-plane controls that a broad OS CIS benchmark does NOT cover.
+# SSH/OS hardening is intentionally left to the OS CIS policy, which uses `c:sshd -T` for
+# accurate effective-config checks (file-only SSH checks miss sshd_config.d drop-ins).
+#
+# Check IDs 90001-90006 do not collide with Wazuh's stock SCA policies (stock IDs are below
+# 90000 as of Wazuh 4.14).
+policy:
+  id: "pve_hardening"
+  file: "pve_hardening.yml"
+  name: "Proxmox VE Management-Plane Hardening"
+  description: "File-based Proxmox VE management-plane hardening checks: datacenter firewall, root two-factor authentication, mail exposure, web UI bind address and auditd presence."
+  references:
+    - https://pve.proxmox.com/wiki/Firewall
+    - https://pve.proxmox.com/wiki/Two-Factor_Authentication
+
+requirements:
+  title: "Check that the host is a Proxmox VE node."
+  description: "These checks only apply to Proxmox VE hosts."
+  condition: any
+  rules:
+    - "f:/usr/bin/pveversion"
+    - "d:/etc/pve"
+
+checks:
+  - id: 90001
+    title: "Ensure the Proxmox datacenter firewall is enabled."
+    description: "The cluster/datacenter firewall master switch gates all PVE firewall rules. When disabled, host and guest firewall rules do not take effect."
+    rationale: "The PVE firewall is the host-level inbound control for the hypervisor management interface; when it is off, the management services are reachable from every network the host is attached to."
+    remediation: "Datacenter > Firewall > Options > Firewall = Yes (writes 'enable: 1' under [OPTIONS] in /etc/pve/firewall/cluster.fw)."
+    condition: all
+    rules:
+      - 'f:/etc/pve/firewall/cluster.fw -> r:^\s*enable:\s*1'
+
+  - id: 90002
+    title: "Ensure the datacenter firewall default input policy is DROP."
+    description: "The default inbound policy should deny traffic that is not explicitly allowed."
+    rationale: "A default-ACCEPT input policy exposes every management service (8006 web UI, SSH, SPICE, NoVNC) to any network that can route to the host."
+    remediation: "Datacenter > Firewall > Options > Input Policy = DROP (writes 'policy_in: DROP' to /etc/pve/firewall/cluster.fw)."
+    condition: all
+    rules:
+      - 'f:/etc/pve/firewall/cluster.fw -> r:policy_in:\s*DROP'
+
+  - id: 90003
+    title: "Ensure two-factor authentication is configured for root@pam."
+    description: "The root@pam account is the PVE super-admin. It should require a second factor (TOTP/WebAuthn/Yubico)."
+    rationale: "Without 2FA, a single guessed or stolen root password grants full hypervisor control to anyone who can reach the web UI."
+    remediation: "Datacenter > Permissions > Two Factor > add a factor for root@pam (writes an entry to /etc/pve/priv/tfa.cfg)."
+    condition: all
+    rules:
+      - 'f:/etc/pve/priv/tfa.cfg -> r:root@pam'
+
+  - id: 90004
+    title: "Ensure the Postfix MTA listens on loopback only."
+    description: "Proxmox installs Postfix for notification mail. It should not accept network connections."
+    rationale: "A network-listening MTA on the hypervisor is needless attack surface."
+    remediation: "Set 'inet_interfaces = loopback-only' (or 'localhost') in /etc/postfix/main.cf and restart postfix."
+    condition: all
+    # pcre2: the default SCA regex engine (OS_Regex) has no grouped alternation, so
+    # "(loopback-only|localhost)" would never match and a compliant host would fail.
+    regex_type: pcre2
+    rules:
+      - 'f:/etc/postfix/main.cf -> r:^\s*inet_interfaces\s*=\s*(loopback-only|localhost)'
+
+  - id: 90005
+    title: "Ensure auditd is installed on the hypervisor."
+    description: "Wazuh's auditd-based detections depend on a running auditd."
+    rationale: "Without auditd, the hypervisor produces no syscall/EXECVE telemetry for the SIEM."
+    remediation: "apt-get install auditd and deploy audit rules to /etc/audit/rules.d/ (e.g. this pack's audit-rules/99-wazuh-mitre.rules)."
+    condition: any
+    rules:
+      - 'f:/sbin/auditd'
+      - 'f:/usr/sbin/auditd'
+
+  - id: 90006
+    title: "Ensure the pveproxy web service is restricted to a management IP."
+    description: "By default pveproxy (port 8006) listens on all interfaces; binding it to the management IP reduces exposure."
+    rationale: "Binding the web UI to a single management address keeps it off other reachable networks."
+    remediation: "Set LISTEN_IP=\"<mgmt-ip>\" in /etc/default/pveproxy and restart pveproxy (review first — an unreachable LISTEN_IP locks out the UI)."
+    condition: all
+    rules:
+      - 'f:/etc/default/pveproxy -> r:^\s*LISTEN_IP='

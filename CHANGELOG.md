@@ -3,6 +3,21 @@
 All notable changes to this pack are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-10-26
+
+### Added
+- **SCA hardening policy** `sca/pve_hardening.yml` ("Proxmox VE Management-Plane Hardening",
+  checks 90001–90006): datacenter firewall enabled, default input policy DROP, `root@pam`
+  2FA, Postfix loopback-only, auditd installed, pveproxy `LISTEN_IP` set. File-only — no
+  command checks, so `sca.remote_commands` stays 0.
+- Rule **101511** (L10, section G): failed check of that policy (child of stock 19007,
+  matched on the policy name). Other policies' failures stay at L7.
+
+### Changed
+- README: SCA policy section, deployment via the `proxmox` agent group (`agent.conf`
+  `<sca><policies>`), rule table, contents, ID list and collision-check command
+  (`101511` added).
+
 ## [1.2.0] — 2026-10-26
 
 ### Added

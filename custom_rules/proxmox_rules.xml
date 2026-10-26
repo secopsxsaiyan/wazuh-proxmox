@@ -27,11 +27,11 @@
     - routine admin (VM create / vzdump / migrate / pveum) -> L6-L8 (visibility, below gate).
     - status/housekeeping -> handled by stock 87200/pvestatd, not re-rated here.
 
-  Rule IDs 100390-100394, 100416-100431, 100433-100437, 100023 (100432 unused; verify the
-  range is free on your manager before installing).
+  Rule IDs 100390-100394, 100416-100431, 100433-100437, 100023, 101511 (100432 unused; verify
+  the range is free on your manager before installing).
   NB: 100400-100415 are deliberately skipped (commonly used by community Sysmon rulesets).
   Check for collisions before installing:
-    grep -rhoE 'rule id="(10039[0-4]|1004(1[6-9]|2[0-9]|3[013-7])|100023)"' \
+    grep -rhoE 'rule id="(10039[0-4]|1004(1[6-9]|2[0-9]|3[013-7])|100023|101511)"' \
       /var/ossec/etc/rules/ /var/ossec/ruleset/rules/   # expect: empty
 
   *** VALIDATE BEFORE TRUSTING (two known unknowns) ***
@@ -374,6 +374,25 @@
     <match>Memory cgroup out of memory</match>
     <description>cgroup OOM: a container/VM hit its memory limit (not a host-wide OOM)</description>
     <group>system_availability,</group>
+  </rule>
+
+</group>
+
+<!-- ============================================================
+     G. SCA: Proxmox VE management-plane hardening failures  (child of stock 19007)
+     Stock 19007 reports every failed SCA check at L7 — fine for broad OS benchmarks with
+     dozens of findings, but it hides the handful of PVE-specific management-plane gaps.
+     This escalates ONLY failures of this pack's sca/pve_hardening.yml policy (matched by
+     policy NAME) to L10. Other policies' failures stay at 19007 L7; passed checks are not
+     touched. PREREQ: the policy deployed to the Proxmox agent group (see README).
+     ============================================================ -->
+<group name="proxmox,proxmox-ve,sca,">
+
+  <rule id="101511" level="10">
+    <if_sid>19007</if_sid>
+    <field name="sca.policy">^Proxmox VE Management-Plane Hardening$</field>
+    <description>SCA Proxmox VE hardening FAILED: $(sca.check.title) — hypervisor management-plane gap.</description>
+    <group>pve_hardening,</group>
   </rule>
 
 </group>

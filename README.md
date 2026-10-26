@@ -2,8 +2,9 @@
 
 Custom Wazuh content that adds **Proxmox VE** hypervisor threat detection — VM/CT lifecycle,
 snapshot deletion / rollback and backup failures (anti-recovery), rogue-admin / API-token creation,
-web-UI/API brute force, and `/etc/pve` cluster-config tampering —
-with MITRE ATT&CK tags and a ready-made **"Proxmox VE Security & Threats"** dashboard.
+web-UI/API brute force, `/etc/pve` cluster-config tampering and a file-only **SCA hardening
+policy** for the PVE management plane — with MITRE ATT&CK tags and a ready-made
+**"Proxmox VE Security & Threats"** dashboard.
 
 > **Agent, not syslog.** Proxmox VE is Debian-based and runs the Wazuh **agent**, so it inherits the
 > entire stock Linux ruleset (SSH, sudo, PAM, dpkg, kernel, auditd) plus Wazuh's **stock Proxmox VE
@@ -34,6 +35,7 @@ is a **rules-only** pack that chains off stock decoders/rules:
 | kernel OOM | stock **5108** (L12 for host-wide *and* cgroup OOM) | cgroup-vs-host split (100426/100427) |
 | `pveproxy/access.log` | `0375-web-accesslog` → `srcip`/`url`/`id`; rules **31100/31108/31101** | PVE-labelled login + brute force (100416–100418). NB: 100416 declares `if_sid=31100,31108` because stock **31108** (L0 "Ignored URLs") claims every 2xx line as a 31100 child — without the dual parent, 100416 is never evaluated (verified with `wazuh-logtest`). |
 | `/etc/pve` FIM | stock syscheck parents **550/553/554** | per-file escalation (100419–100425, 100434) |
+| SCA scan results | stock SCA rules (failed check **19007**) | hardening-policy failures escalated (101511) + the policy itself (`sca/pve_hardening.yml`) |
 
 **Already covered by Wazuh's stock `0495-proxmox-ve_rules.xml` (do _not_ duplicate):** `87201` (L6) PVE
 auth failure, `87202` (L10) PVE brute force, `87203` (L3) PVE auth success. This pack keeps them as the
@@ -42,9 +44,12 @@ safety net and adds only what they leave silent (everything else routes to `8720
 ## Contents
 
 ```
-proxmox_rules.xml      # 27 rules (100390–100437 except 100432, + 100023): VM/CT lifecycle, pveum, web-UI auth,
-                       #   /etc/pve FIM, snapshot/backup integrity (section D), Wazuh-layer mawk
-                       #   de-rate (section E), kernel cgroup-OOM split (section F)
+proxmox_rules.xml      # 28 rules (100390–100437 except 100432, + 100023, 101511): VM/CT lifecycle, pveum,
+                       #   web-UI auth, /etc/pve FIM, snapshot/backup integrity (section D), Wazuh-layer
+                       #   mawk de-rate (section E), kernel cgroup-OOM split (section F), SCA
+                       #   hardening-failure escalation (section G)
+sca/
+  pve_hardening.yml    # file-only SCA policy "Proxmox VE Management-Plane Hardening" (checks 90001–90006)
 audit-rules/
   99-wazuh-mitre.rules # auditd kernel rules for /etc/audit/rules.d/ on the Proxmox host:
                        #   execve never-rules (daemon firehose suppression) + full MITRE watch-list
@@ -118,6 +123,42 @@ Host-wide `Out of memory:` lines (no `Memory cgroup`) still fire stock `5108` at
 **Scope:** `5108` is generic, so these two rules apply to **every Linux agent**, not only Proxmox hosts.
 They are deliberately kept out of the `proxmox` group (they do not appear on the Proxmox dashboard).
 Edit the process list in 100426 to match the services that matter in your environment.
+
+### SCA: management-plane hardening (section G)
+
+`sca/pve_hardening.yml` is a small **file-only** Wazuh SCA policy (`Proxmox VE Management-Plane
+Hardening`, checks **90001–90006**) for PVE-specific controls that a broad OS CIS benchmark does not
+cover. SSH/OS hardening is intentionally left to the OS CIS policy, which uses `c:sshd -T` for
+accurate effective-config checks.
+
+| Check | Control | Evidence |
+|-------|---------|----------|
+| 90001 | Datacenter firewall enabled | `enable: 1` in `/etc/pve/firewall/cluster.fw` |
+| 90002 | Datacenter default input policy is DROP | `policy_in: DROP` in `cluster.fw` |
+| 90003 | Two-factor authentication configured for `root@pam` | `root@pam` entry in `/etc/pve/priv/tfa.cfg` |
+| 90004 | Postfix listens on loopback only | `inet_interfaces = loopback-only` / `localhost` in `/etc/postfix/main.cf` |
+| 90005 | auditd installed | `/sbin/auditd` or `/usr/sbin/auditd` exists |
+| 90006 | pveproxy web UI bound to a management IP | `LISTEN_IP=` in `/etc/default/pveproxy` |
+
+| Rule | Level | Event | MITRE |
+|------|-------|-------|-------|
+| 101511 | **10** | a check of **this** policy failed (child of stock `19007`, matched on the policy name) | — |
+
+Stock `19007` reports every failed SCA check at L7 — fine for an OS benchmark with dozens of
+findings, but it buries the handful of hypervisor management-plane gaps. `101511` escalates only
+this policy's failures; other policies stay at L7 and passed checks are untouched. Rule 101511
+matches the policy **name**, so keep `name:` unchanged if you edit the YAML.
+
+**Design: no remote commands.** Every check is an `f:`/`d:` file check, so the agent runs no
+commands for this policy and `sca.remote_commands` can (and should) stay at its default **0** in the
+agent's `local_internal_options.conf`. A compromised manager therefore cannot use SCA to execute
+commands on the hypervisor.
+
+**Honest limits:** the policy only applies to hosts with `/usr/bin/pveversion` or `/etc/pve`
+(elsewhere it is skipped as not applicable). A missing evidence file — no `tfa.cfg` at all, no
+`/etc/default/pveproxy` — is reported by SCA as *not applicable*, not *failed*. 90004 uses
+`regex_type: pcre2` because the default SCA regex engine has no grouped alternation. Check IDs
+90001–90006 do not collide with Wazuh's stock SCA policies (verified on 4.14.5).
 
 ## Auditd noise-suppression rules (section E)
 
@@ -197,8 +238,8 @@ docker exec wazuh.manager chown wazuh:wazuh /var/ossec/etc/rules/proxmox_rules.x
 docker exec wazuh.manager /var/ossec/bin/wazuh-analysisd -t   # expect no errors
 docker exec wazuh.manager /var/ossec/bin/wazuh-control restart
 ```
-> First confirm the `100390–100394, 100416–100431, 100433–100437` and `100023` IDs are free on your manager:
-> `docker exec wazuh.manager grep -rhoE 'rule id="(10039[0-4]|1004(1[6-9]|2[0-9]|3[013-7])|100023)"' /var/ossec/etc/rules/ /var/ossec/ruleset/rules/` (expect empty).
+> First confirm the `100390–100394, 100416–100431, 100433–100437`, `100023` and `101511` IDs are free on your manager:
+> `docker exec wazuh.manager grep -rhoE 'rule id="(10039[0-4]|1004(1[6-9]|2[0-9]|3[013-7])|100023|101511)"' /var/ossec/etc/rules/ /var/ossec/ruleset/rules/` (expect empty).
 
 ### 2. Feed the agent: collect the access.log + watch `/etc/pve`
 Rules 100416–100418 need the pveproxy access.log, and 100419–100425 / 100434 need `/etc/pve` FIM
@@ -246,7 +287,27 @@ docker exec wazuh.manager /var/ossec/bin/agent_groups -a -i <AGENT ID> -g proxmo
 docker exec wazuh.manager /var/ossec/bin/verify-agent-conf    # no output = clean
 ```
 
-### 3. Import the dashboard
+### 3. Deploy the SCA hardening policy (section G)
+Copy the policy into the `proxmox` group's shared directory on the manager — group files are
+pushed to member agents and land in the agent's `/var/ossec/etc/shared/`:
+```bash
+docker cp sca/pve_hardening.yml wazuh.manager:/var/ossec/etc/shared/proxmox/pve_hardening.yml
+docker exec wazuh.manager chown wazuh:wazuh /var/ossec/etc/shared/proxmox/pve_hardening.yml
+```
+and enable it in the same group `agent.conf` (`/var/ossec/etc/shared/proxmox/agent.conf`), inside
+`<agent_config>`:
+```xml
+  <sca>
+    <policies>
+      <policy>etc/shared/pve_hardening.yml</policy>
+    </policies>
+  </sca>
+```
+Leave `sca.remote_commands` at **0** on the Proxmox agent — the policy needs no commands. Run
+`verify-agent-conf` again; the agent picks the policy up on its next SCA scan (or restart it).
+Failed checks then raise **101511** (L10); confirm in the agent's SCA tab in the Wazuh dashboard.
+
+### 4. Import the dashboard
 ```bash
 docker cp dashboards/wazuh_proxmox_dashboard.ndjson wazuh.dashboard:/tmp/
 docker exec wazuh.dashboard curl -sk -u <ADMIN>:<INDEXER_PASSWORD> \
@@ -255,6 +316,9 @@ docker exec wazuh.dashboard curl -sk -u <ADMIN>:<INDEXER_PASSWORD> \
 ```
 Regenerate after editing panels (writes `wazuh_proxmox_dashboard.ndjson` to the current dir):
 `cd dashboards && python3 gen_proxmox_dashboard.py` (stdlib only).
+SCA hardening failures (101511) carry the `proxmox` group, so they appear in the overview,
+event-type and high-severity panels; there is no dedicated SCA panel (use the agent's SCA
+tab for per-check detail).
 
 ## Notes & tuning
 
